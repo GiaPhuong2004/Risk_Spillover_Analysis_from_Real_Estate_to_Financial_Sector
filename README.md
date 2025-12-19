@@ -2,7 +2,7 @@
 
 This study analyzes the spillover risk transmission from the real estate sector to financial sectors in Vietnam during the period 2018–2024 using ΔCoVaR based on the ARMA–GJR–GARCH–DCC–Copula model.
 
-## 🎯 Research Objective
+## 🎯 Study Objective
 
 - Measure the risk spillover effect from the real estate sector to key financial sectors in Vietnam:
   - banking (tổ chức tín dụng)
@@ -30,7 +30,7 @@ This study analyzes the spillover risk transmission from the real estate sector 
 
 ## 🧠 Methodology Overview
 
-- The research methodology follows a 5-step quantitative pipeline:
+- The study methodology follows a 5-step quantitative pipeline:
 
   - Step 1: Estimate the ARIMA(p,d,q) model for the return series and select the optimal ARIMA model, consistent for the entire dataset.  
   - Step 2: Combine ARIMA with GARCH/GJR-GARCH to model conditional variance and select the optimal GARCH model for all sectors.  
