@@ -47,23 +47,23 @@ This study analyzes the spillover risk transmission from the real estate sector 
 ## 📈 Tools & Libraries
 - **R** programming language
 - R packages:
-  - readxl  
-  - tidyr  
-  - dplyr  
-  - purr  
-  - stringr  
-  - tseries  
-  - FinTS  
-  - fBasics  
-  - urca  
-  - lmtest  
-  - forecast  
-  - rugarch  
-  - psych  
-  - fGarch  
-  - copula  
-  - qrmtools  
-  - lubridate  
+  - `readxl`  
+  - `tidyr`  
+  - `dplyr`  
+  - `purr`  
+  - `stringr`  
+  - `tseries`  
+  - `FinTS`  
+  - `fBasics`  
+  - `urca`  
+  - `lmtest`  
+  - `forecast`  
+  - `rugarch`  
+  - `psych`  
+  - `fGarch`  
+  - `copula`  
+  - `qrmtools`  
+  - `lubridate`  
 
 ## 👤 Author
 
