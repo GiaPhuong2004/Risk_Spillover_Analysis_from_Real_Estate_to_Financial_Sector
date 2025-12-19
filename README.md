@@ -2,6 +2,19 @@
 
 This study analyzes the spillover risk transmission from the real estate sector to financial sectors in Vietnam during the period 2018–2024 using ΔCoVaR based on the ARMA–GJR–GARCH–DCC–Copula model.
 
+## 📂 Files
+- `Dữ liệu Lịch sử Banks.xlsx` - historical data for the banking sector
+
+- `Dữ liệu Lịch sử Financial Services.xlsx` - historical data for the financial services sector
+
+- `Dữ liệu Lịch sử Insurance.xlsx` - historical data for the insurance sector
+
+- `Dữ liệu Lịch sử Real Estate.xlsx` - historical data for the real estate sector
+
+- `Risk_Spillover_RealEstate_Financial_Vietnam_code.Rmd` - R Markdown source file with full code
+
+- `Risk_Spillover_RealEstate_Financial_Vietnam_code.html` — rendered HTML output produced from the R Markdown file (viewable in browser)
+
 ## 🎯 Study Objective
 
 - Measure the risk spillover effect from the real estate sector to key financial sectors in Vietnam:
