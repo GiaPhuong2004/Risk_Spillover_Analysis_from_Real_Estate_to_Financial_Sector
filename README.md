@@ -4,16 +4,12 @@ This study analyzes the spillover risk transmission from the real estate sector 
 
 ## 🎯 Research Objective
 
-Measure the risk spillover effect from the real estate sector to key financial sectors in Vietnam:
+- Measure the risk spillover effect from the real estate sector to key financial sectors in Vietnam:
   - banking (tổ chức tín dụng)
   - financial services (dịch vụ tài chính)
   - insurance (bảo hiểm)
   - general finance (tài chính nói chung)
 
-- Model return series using ARIMA for optimal parameter selection
-- Estimate dynamic correlations between sectors using DCC-GARCH
-- Capture nonlinear dependence structures via Copula models
-- Compute spillover risk using CoVaR and ΔCoVaR indicators
 - Provide empirical insights into risk spillover mechanisms between markets
 
 ## 📅 Data Description
