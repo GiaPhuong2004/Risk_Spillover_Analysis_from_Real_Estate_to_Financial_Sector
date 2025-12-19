@@ -1,4 +1,4 @@
-# 📌 Risk-Spillover-Analysis-from-Real-Estate-to-Financial-Sector
+# 📌 Risk Spillover Analysis from Real Estate to Financial Sector
 
 This study analyzes the spillover risk transmission from the real estate sector to financial sectors in Vietnam during the period 2018–2024 using ΔCoVaR based on the ARMA–GJR–GARCH–DCC–Copula model.
 
