@@ -1,0 +1,1559 @@
+---
+title: Risk Spillover Analysis from Real Estate to Financial Sector
+author: "GiaPhuong"
+output:
+  html_document:
+    df_print: paged
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(tseries)
+library(FinTS)
+library(fBasics)
+library(urca)
+library(lmtest)
+library(forecast)
+library(rugarch)
+library(ggplot2)
+library(Metrics)
+library(rmgarch)
+library(rugarch)
+library(psych)
+library(fGarch)
+library(copula)
+library(qrmtools)
+library(lubridate)
+```
+
+## 1. Xứ lí dữ liệu đầu vào
+### 1.1. Nhập dữ liệu
+```{r}
+# Danh sách file path (mỗi file là một ngành)
+file_paths <- list(
+  "D:/Khoa_luan/Dữ liệu Lịch sử Real Estate.xlsx",
+  "D:/Khoa_luan/Dữ liệu Lịch sử Banks.xlsx",
+  "D:/Khoa_luan/Dữ liệu Lịch sử Financial Services.xlsx",
+  "D:/Khoa_luan/Dữ liệu Lịch sử Insurance.xlsx"
+)
+
+# Hàm chuyển đổi giá trị KL
+convert_value <- function(x) {
+  if (is.na(x)) return(NA_real_)
+  if (str_ends(x, "K")) {
+    num <- as.numeric(str_remove(x, "K"))
+    return(num * 1e3)
+  } else if (str_ends(x, "M")) {
+    num <- as.numeric(str_remove(x, "M"))
+    return(num * 1e6)
+  } else {
+    return(suppressWarnings(as.numeric(x)))
+  }
+}
+
+# Khởi tạo danh sách để lưu dữ liệu từ các file
+merged_cp_list <- list()
+merged_kl_list <- list()
+
+# Xử lý từng file
+for (file_path in file_paths) {
+  sheet_names <- excel_sheets(file_path)
+  
+  # Tên ngành từ file path (Real Estate, Banks, Financial Services, Insurance)
+  industry_name <- str_extract(file_path, "(?<=Dữ liệu Lịch sử ).*(?=\\.xlsx)")
+  
+  # Xử lý giá đóng cửa
+  data_cp <- map(sheet_names, function(sheet) {
+    stock_code <- sub("Dữ liệu Lịch sử ", "", sheet)
+    
+    read_excel(file_path, sheet = sheet) %>%
+      select(Ngày, `Lần cuối`) %>%
+      mutate(Date = as.Date(Ngày, format = "%d/%m/%Y")) %>%
+      select(Date, `Lần cuối`) %>%
+      rename(!!stock_code := `Lần cuối`)
+  })
+  
+  # Gộp theo Date cho giá đóng cửa
+  merged_cp <- purrr::reduce(data_cp, full_join, by = "Date") %>%
+    arrange(Date)
+  
+  # Lưu DataFrame giá đóng cửa cho ngành
+  merged_cp_list[[industry_name]] <- merged_cp
+  
+  # Xử lý khối lượng giao dịch
+  data_kl <- map(sheet_names, function(sheet) {
+    stock_code <- sub("Dữ liệu Lịch sử ", "", sheet)
+    
+    read_excel(file_path, sheet = sheet) %>%
+      select(Ngày, KL) %>%
+      mutate(Date = as.Date(Ngày, format = "%d/%m/%Y")) %>%
+      select(Date, KL) %>%
+      rename(!!stock_code := KL)
+  })
+  
+  # Gộp theo Date cho khối lượng giao dịch
+  merged_kl <- purrr::reduce(data_kl, full_join, by = "Date") %>%
+    arrange(Date)
+  
+  # Chuyển đổi giá trị KL
+  merged_kl <- merged_kl %>%
+    mutate(across(-Date, ~ sapply(.x, convert_value)))
+  
+  # Lưu DataFrame khối lượng giao dịch cho ngành
+  merged_kl_list[[industry_name]] <- merged_kl
+}
+
+# Giờ có 8 DataFrame riêng biệt cho từng ngành
+
+# In kết quả cho từng DataFrame (giá đóng cửa và khối lượng giao dịch)
+print(head(merged_cp_list[["Real Estate"]]))  # Giá đóng cửa Real Estate
+print(head(merged_kl_list[["Real Estate"]]))  # Khối lượng giao dịch Real Estate
+
+print(head(merged_cp_list[["Banks"]]))        # Giá đóng cửa Banks
+print(head(merged_kl_list[["Banks"]]))        # Khối lượng giao dịch Banks
+
+print(head(merged_cp_list[["Financial Services"]]))  # Giá đóng cửa Financial Services
+print(head(merged_kl_list[["Financial Services"]]))  # Khối lượng giao dịch Financial Services
+
+print(head(merged_cp_list[["Insurance"]]))  # Giá đóng cửa Insurance
+print(head(merged_kl_list[["Insurance"]]))  # Khối lượng giao dịch Insurance
+```
+
+### 1.2. Tính giá đóng cửa và lợi suất từng ngành
+```{r}
+# Tính giá đóng cửa ngành theo KL cho từng ngành
+industry_avg_cp <- map2(merged_cp_list, merged_kl_list, function(cp_df, kl_df) {
+  # Thay NA bằng 0 trước khi tính
+  cp_filled <- cp_df %>% mutate(across(-Date, ~ replace_na(.x, 0)))
+  kl_filled <- kl_df %>% mutate(across(-Date, ~ replace_na(.x, 0)))
+  
+  # Tính giá trị: sum(cp * kl) / sum(kl)
+  weighted_cp <- map2_dfc(cp_filled[-1], kl_filled[-1], ~ .x * .y)
+  total_value <- rowSums(weighted_cp, na.rm = TRUE)
+  total_volume <- rowSums(kl_filled[-1], na.rm = TRUE)
+  
+  avg_price <- ifelse(total_volume == 0, NA, total_value / total_volume)
+  
+  tibble(Date = cp_df$Date, Avg_Closing_Price = avg_price)
+})
+
+# Đặt tên cho các ngành trong danh sách
+names(industry_avg_cp) <- names(merged_cp_list)
+
+# Đổi tên cột giá đóng cửa ngành theo tên ngành
+industry_avg_cp_named <- imap(industry_avg_cp, ~ rename(.x, !!.y := Avg_Closing_Price))
+
+# Gộp lại thành 1 bảng duy nhất theo Date
+industry_cp_combined <- purrr::reduce(industry_avg_cp_named, full_join, by = "Date") %>%
+  arrange(Date)
+
+# Xem kết quả
+head(industry_cp_combined)
+```
+
+```{r}
+# --- Tính giá đóng cửa trung bình của ngành Finance (Banks + Financial Services + Insurance) ---
+
+# Lấy dữ liệu giá và KL của 3 ngành tài chính
+finance_cp_list <- merged_cp_list[c("Banks", "Financial Services", "Insurance")]
+finance_kl_list <- merged_kl_list[c("Banks", "Financial Services", "Insurance")]
+
+# Gộp toàn bộ cổ phiếu trong 3 ngành thành 1 bảng lớn
+finance_cp_all <- purrr::reduce(finance_cp_list, full_join, by = "Date")
+finance_kl_all <- purrr::reduce(finance_kl_list, full_join, by = "Date")
+
+# --- thay NA = 0 trước khi tính ---
+finance_cp_filled <- finance_cp_all %>% mutate(across(-Date, ~ replace_na(.x, 0)))
+finance_kl_filled <- finance_kl_all %>% mutate(across(-Date, ~ replace_na(.x, 0)))
+
+# Tính giá đóng cửa trung bình có trọng số: sum(cp * kl) / sum(kl)
+weighted_cp_fin <- map2_dfc(finance_cp_filled[-1], finance_kl_filled[-1], ~ .x * .y)
+total_value_fin <- rowSums(weighted_cp_fin, na.rm = TRUE)
+total_volume_fin <- rowSums(finance_kl_filled[-1], na.rm = TRUE)
+
+avg_finance_price <- ifelse(total_volume_fin == 0, NA, total_value_fin / total_volume_fin)
+
+# Tạo bảng Finance
+finance_cp <- tibble(Date = finance_cp_all$Date, Finance = avg_finance_price)
+
+# Gộp thêm vào industry_cp_combined
+industry_cp_combined <- industry_cp_combined %>%
+  full_join(finance_cp, by = "Date") %>%
+  arrange(Date)
+
+# Xem kết quả
+head(industry_cp_combined)
+```
+
+```{r}
+#Loc data giai doan 2018 - 2024
+industry_closing_price <- industry_cp_combined %>%
+  filter(Date >= as.Date("2018-01-01") & Date <= as.Date("2024-12-31"))
+print(head(industry_closing_price))
+```
+```{r}
+#Tính return rate theo công thức log(Pt / Pt-1) * 100
+industry_return <- industry_closing_price %>%
+  arrange(Date) %>%  # Đảm bảo dữ liệu theo thứ tự thời gian
+  mutate(
+    `Real Estate` = 100 * log(`Real Estate` / lag(`Real Estate`)),
+    Banks = 100 * log(Banks / lag(Banks)),
+    `Financial Services` = 100 * log(`Financial Services` / lag(`Financial Services`)),
+    `Insurance` = 100 * log(`Insurance` / lag(`Insurance`)),
+    `Finance` = 100 * log(`Finance` / lag(`Finance`)),
+  )
+print(head(industry_return))
+```
+
+```{r}
+colnames(industry_closing_price) <- c("Date", "RealEstate", "Banks", "FinancialServices", "Insurance", "Finance")
+
+# Lấy danh sách các ngành
+industries <- colnames(industry_closing_price)[colnames(industry_closing_price) != "Date"]
+
+# Vòng lặp vẽ từng ngành
+for (ind in industries) {
+  p <- ggplot(industry_closing_price, aes_string(x = "Date", y = ind)) +
+    geom_line(color = "steelblue") +
+    labs(
+      title = paste("Giá đóng cửa ngành", ind, "2018-2024"),
+      x = "Ngày",
+      y = "Giá đóng cửa"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+  print(p)
+}
+```
+```{r}
+colnames(industry_return) <- c("Date", "RealEstate", "Banks", "FinancialServices", "Insurance", "Finance")
+
+# Lấy danh sách các ngành
+industries <- colnames(industry_return)[colnames(industry_return) != "Date"]
+
+# Vòng lặp vẽ từng ngành
+for (ind in industries) {
+  p <- ggplot(industry_return, aes_string(x = "Date", y = ind)) +
+    geom_line(color = "steelblue") +
+    labs(
+      title = paste("Lợi suất ngành", ind, "2018-2024"),
+      x = "Ngày",
+      y = "Lợi suất"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+  print(p)
+}
+```
+
+```{r}
+# Vòng lặp vẽ histogram + density cho từng ngành
+for (ind in industries) {
+  p <- ggplot(industry_return, aes_string(x = ind)) +
+    geom_histogram(aes(y = ..density..),   # histogram theo mật độ
+                   bins = 40,            # số cột
+                   fill = "steelblue",
+                   color = "white",
+                   alpha = 0.7) +
+    geom_density(aes(y = ..density..),     # phủ đường density
+                 color = "red",
+                 size = 1) +
+    labs(
+      title = paste("Phân phối lợi suất ngành", ind, "2018–2024"),
+      x = "Lợi suất",
+      y = "Tần suất"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+  
+  print(p)
+}
+```
+
+```{r}
+describe(na.omit(industry_return[, c("RealEstate", "Banks", "FinancialServices","Insurance","Finance")]))
+```
+
+## 2.Mô hình ARIMA 
+### 2.1. Kiểm định JB và tính dừng 
+```{r}
+#Kiểm định JB cho từng ngành
+jb_results <- lapply(na.omit(industry_return[, c("RealEstate", "Banks", "FinancialServices","Insurance","Finance")]), function(x) jarque.bera.test(na.omit(x)))
+jb_results
+```
+```{r}
+#Kiểm định ADF
+for (ind in industries) {
+  cat("\n============================\n")
+  cat("Kết quả ADF test cho ngành:", ind, "\n")
+  cat("============================\n\n")
+  
+  series <- na.omit(industry_return)[[ind]]
+  
+  # Kiểm định ADF với trend
+  adf_trend <- ur.df(series, type = "trend", selectlags = "AIC")
+  cat(">> ADF với trend:\n")
+  print(summary(adf_trend))
+  
+  # Kiểm định ADF với drift
+  adf_drift <- ur.df(series, type = "drift", selectlags = "AIC")
+  cat("\n>> ADF với drift:\n")
+  print(summary(adf_drift))
+  
+  # Kiểm định ADF không có hằng số hay trend
+  adf_none <- ur.df(series, type = "none", selectlags = "AIC")
+  cat("\n>> ADF không constant, không trend:\n")
+  print(summary(adf_none))
+}
+```
+```{r}
+for (ind in industries) {
+  cat("\n============================\n")
+  cat("Kiểm định Ljung–Box cho ngành:", ind, "\n")
+  cat("============================\n\n")
+  
+  series <- na.omit(industry_return)[[ind]]
+  
+  # Kiểm định Ljung-Box ở nhiều độ trễ (lag)
+  for (lag in c(1, 5, 10)) {
+    lb_test <- Box.test(series, lag = lag, type = "Ljung-Box")
+    cat("Lag =", lag, " | p-value =", lb_test$p.value, "\n")
+  }
+}
+```
+
+### 2.2. ACF và PACF
+```{r}
+#ACF, PCF
+for (ind in industries) {
+  series <- na.omit(industry_return[[ind]])
+  
+  # ACF plot with title
+  acf(series, main = paste("ACF -", ind))
+  
+  # PACF plot with title
+  pacf(series, main = paste("PACF -", ind))
+}
+```
+
+### 2.3. Chạy mô hình ARIMA(p,d,q)
+```{r}
+# Tạo list rỗng để lưu kết quả mô hình
+arma_models <- list()
+
+# Lặp qua từng ngành
+for (ind in industries) {
+  cat("🔹 Đang chạy auto.arima cho ngành:", ind, "\n")
+  
+  y <- industry_return[[ind]]
+  
+  # Chạy auto.arima
+  fit <- auto.arima(y,
+                    d = 0,            # returns thường đã dừng
+                    seasonal = FALSE, 
+                    ic = "aic",      
+                    stepwise = FALSE, 
+                    approximation = FALSE)
+  
+  # Lưu mô hình vào list
+  arma_models[[ind]] <- fit
+  
+  # In tóm tắt kết quả
+  print(summary(fit))
+  cat("------------------------------------------------------------\n\n")
+}
+```
+```{r}
+#Kiểm định Ljung-Box
+# Fit ARIMA(2,0,4) cho tất cả các chuỗi
+fixed_arima_models <- list()
+
+for (ind in industries) {
+  cat("Fitting ARIMA(2,0,4) for ngành:", ind, "\n")
+  fixed_arima_models[[ind]] <- Arima(na.omit(industry_return[[ind]]), order = c(2,0,4),include.mean = FALSE)
+  }
+library(FinTS)
+
+lags_to_check <- c(1, 5, 10)
+
+for (ind in names(fixed_arima_models)) {
+  cat("🔹 Ngành:", ind, "\n")
+  fit <- fixed_arima_models[[ind]]
+  
+  # Residuals
+  resid <- residuals(fit)
+  
+  # Kiểm định cho từng lag
+  for (lag_val in lags_to_check) {
+    lb <- Box.test(resid, lag = lag_val, type = "Ljung-Box")
+    cat("  Ljung-Box lag(", lag_val, "): p-value =", round(lb$p.value, 4))
+    
+    if (lb$p.value < 0.05) {
+      cat(" ⚠️  Phần dư còn tự tương quan.\n")
+    } else {
+      cat(" ✅  Phần dư không có tự tương quan đáng kể.\n")
+    }
+  }
+  cat("------------------------------------------------------------\n")
+}
+```
+
+### 2.4. Kiểm định Engle
+```{r}
+#Engle-ARCH Test
+# Fit ARIMA(2,0,4) cho tất cả các chuỗi
+fixed_arima_models <- list()
+
+for (ind in industries) {
+  cat("Fitting ARIMA(2,0,4) for ngành:", ind, "\n")
+  fixed_arima_models[[ind]] <- Arima(na.omit(industry_return[[ind]]), order = c(2,0,4),include.mean = FALSE)
+  }
+library(FinTS)
+
+lags_to_check <- c(1, 5, 10)
+
+for (ind in names(fixed_arima_models)) {
+  cat("🔹 Ngành:", ind, "\n")
+  fit <- fixed_arima_models[[ind]]
+  
+  # Residuals
+  resid <- residuals(fit)
+  
+  # ARCH tests
+  for (lag_val in lags_to_check) {
+    arch_test <- ArchTest(resid, lags = lag_val)
+    
+    cat("  Engle's ARCH Test (lag =", lag_val, "): p-value =", round(arch_test$p.value, 4), "\n")
+    
+    if (arch_test$p.value < 0.05) {
+      cat("  ⚠️  Có ARCH effect → mô hình ARIMA(2,0,4) KHÔNG đủ, nên xem xét GARCH.\n")
+    } else {
+      cat("  ✅  Không có ARCH effect đáng kể.\n")
+    }
+  }
+  cat("------------------------------------------------------------\n")
+}
+```
+
+
+## 3. Mô hình GARCH
+### 3.1. sGARCH
+```{r}
+#Chạy ARMA-sGARCH
+
+#-------------------------
+# ARMA-GARCH cho nhiều ngành & phân phối
+#-------------------------
+
+library(rugarch)
+library(tseries)   # cho ArchTest
+
+# Danh sách phân phối thử
+dist_list <- c("norm", "std", "sstd", "ged", "sged")
+
+# Tạo dataframe lưu kết quả
+results <- data.frame(
+  Industry = character(),
+  Distribution = character(),
+  omega = numeric(),
+  omega_sd = numeric(),
+  alpha1 = numeric(),
+  alpha1_sd = numeric(),
+  beta1 = numeric(),
+  beta1_sd = numeric(),
+  shape = numeric(),
+  shape_sd = numeric(),
+  skew = numeric(),
+  skew_sd = numeric(),
+  LLF = numeric(),
+  AIC = numeric(),
+  BIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Vòng lặp qua ngành (bỏ cột Date)
+for (ind in names(industry_return)[names(industry_return) != "Date"]) {
+  
+  ret <- na.omit(as.numeric(industry_return[[ind]]))  # chỉ lấy giá trị số
+  
+  # Lấy order ARMA từng ngành
+  p <- 2
+  q <- 4
+  
+  cat("🔹 Ngành:", ind, "\n")
+  
+  # Vòng lặp qua phân phối
+  for (dist in dist_list) {
+    spec <- ugarchspec(
+      variance.model = list(model = "sGARCH", garchOrder = c(3,1)),
+      mean.model = list(armaOrder = c(p, q),include.mean = FALSE),
+      distribution.model = dist
+    )
+    
+    garch_fit <- tryCatch({
+      ugarchfit(spec = spec, data = ret)
+    }, error = function(e) {
+      cat("  ⚠️ Lỗi fit GARCH cho", dist, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(garch_fit)) {
+      # Lấy thông số
+      coefs <- coef(garch_fit)
+      se <- sqrt(diag(garch_fit@fit$matcoef))
+      
+      shape <- if("shape" %in% names(coefs)) coefs["shape"] else NA
+      shape_sd <- if("shape" %in% names(se)) se["shape"] else NA
+      skew <- if("skew" %in% names(coefs)) coefs["skew"] else NA
+      skew_sd <- if("skew" %in% names(se)) se["skew"] else NA
+      
+      # Lưu kết quả
+      results <- rbind(results, data.frame(
+        Industry = ind,
+        Distribution = dist,
+        omega = coefs["omega"], omega_sd = se["omega"],
+        alpha1 = coefs["alpha1"], alpha1_sd = se["alpha1"],
+        beta1 = coefs["beta1"], beta1_sd = se["beta1"],
+        shape = shape, shape_sd = shape_sd,
+        skew = skew, skew_sd = skew_sd,
+        LLF = likelihood(garch_fit),
+        AIC = infocriteria(garch_fit)[1],
+        BIC = infocriteria(garch_fit)[2]
+      ))
+      
+      cat("  ✅ Fit thành công cho", dist, "\n")
+      
+      # Kiểm định Ljung-Box trên phần dư chuẩn hóa
+      resid_std <- residuals(garch_fit, standardize = TRUE)
+      for (lag in c(1,5,10)) {
+        lb <- Box.test(resid_std, lag = lag, type = "Ljung-Box")
+        cat("    Ljung-Box lag(", lag, "): p-value =", round(lb$p.value,4), "\n")
+      }
+      
+      # Kiểm định Engle ARCH
+      for (lag in c(1,5,10)) {
+        arch <- ArchTest(resid_std, lags = lag)
+        cat("    Engle ARCH lag(", lag, "): p-value =", round(arch$p.value,4), "\n")
+      }
+      
+      cat("------------------------------------------------------------\n")
+    }
+  }
+}
+
+
+# Xem kết quả
+print(results)
+
+```
+
+### 3.2. eGARCH
+```{r}
+#--------------------------------------------------------
+# ARMA(2,4) – EGARCH(1,1) với xử lý lỗi hội tụ
+#--------------------------------------------------------
+
+library(rugarch)
+library(tseries)
+
+dist_list <- c("norm", "std", "sstd", "ged", "sged")
+
+results_egarch <- data.frame(
+  Industry = character(),
+  Distribution = character(),
+  omega = numeric(),
+  omega_sd = numeric(),
+  alpha1 = numeric(),
+  alpha1_sd = numeric(),
+  gamma1 = numeric(),
+  gamma1_sd = numeric(),
+  beta1 = numeric(),
+  beta1_sd = numeric(),
+  shape = numeric(),
+  shape_sd = numeric(),
+  skew = numeric(),
+  skew_sd = numeric(),
+  LLF = numeric(),
+  AIC = numeric(),
+  BIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (ind in names(industry_return)[names(industry_return) != "Date"]) {
+  
+  ret <- na.omit(as.numeric(industry_return[[ind]]))
+  
+  p <- 2
+  q <- 4
+  
+  cat("🔹 Ngành:", ind, "\n")
+  
+  for (dist in dist_list) {
+    
+    spec <- ugarchspec(
+      variance.model = list(model = "eGARCH", garchOrder = c(3,1)),
+      mean.model = list(armaOrder = c(p, q), include.mean = FALSE),
+      distribution.model = dist
+    )
+    
+    garch_fit <- tryCatch({
+      ugarchfit(spec = spec, data = ret)
+    }, error = function(e) {
+      cat("  ⚠️ Lỗi fit EGARCH cho", dist, "\n")
+      return(NULL)
+    })
+    
+    # Nếu NULL → bỏ
+    if (is.null(garch_fit)) next
+    
+    # Nếu không hội tụ → bỏ
+    if (garch_fit@fit$convergence != 0) {
+      cat("  ❌ Không hội tụ – bỏ mô hình", dist, "\n")
+      next
+    }
+    
+    # Kiểm tra AIC/BIC
+    ic <- tryCatch(infocriteria(garch_fit), error=function(e) NULL)
+    if (is.null(ic) || any(is.na(ic))) {
+      cat("  ❌ AIC/BIC bị NA – bỏ mô hình", dist, "\n")
+      next
+    }
+    
+    # Nếu OK → lấy kết quả
+    coefs <- coef(garch_fit)
+    se <- sqrt(diag(garch_fit@fit$matcoef))
+    
+    shape <- if("shape" %in% names(coefs)) coefs["shape"] else NA
+    shape_sd <- if("shape" %in% names(se)) se["shape"] else NA
+    
+    skew <- if("skew" %in% names(coefs)) coefs["skew"] else NA
+    skew_sd <- if("skew" %in% names(se)) se["skew"] else NA
+    
+    results_egarch <- rbind(results_egarch, data.frame(
+      Industry = ind,
+      Distribution = dist,
+      omega = coefs["omega"], omega_sd = se["omega"],
+      alpha1 = coefs["alpha1"], alpha1_sd = se["alpha1"],
+      gamma1 = coefs["gamma1"], gamma1_sd = se["gamma1"],
+      beta1 = coefs["beta1"], beta1_sd = se["beta1"],
+      shape = shape, shape_sd = shape_sd,
+      skew = skew, skew_sd = skew_sd,
+      LLF = likelihood(garch_fit),
+      AIC = ic[1],
+      BIC = ic[2]
+    ))
+    
+    cat("  ✅ Fit thành công – lưu kết quả cho", dist, "\n")
+    cat("------------------------------------------------------------\n")
+  }
+}
+
+print(results_egarch)
+
+```
+
+### 3.3. GJR-GARCH
+```{r}
+library(rugarch)
+library(tseries)  # cho ArchTest
+
+# Danh sách phân phối thử
+dist_list <- c("norm", "std", "sstd", "ged", "sged")
+
+# Dataframe lưu kết quả
+results_gjr <- data.frame(
+  Industry = character(),
+  Distribution = character(),
+  omega = numeric(),
+  omega_sd = numeric(),
+  alpha1 = numeric(),
+  alpha1_sd = numeric(),
+  gamma1 = numeric(),
+  gamma1_sd = numeric(),
+  beta1 = numeric(),
+  beta1_sd = numeric(),
+  shape = numeric(),
+  shape_sd = numeric(),
+  skew = numeric(),
+  skew_sd = numeric(),
+  LLF = numeric(),
+  AIC = numeric(),
+  BIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Tham số ARMA cố định (ARMA(2,4))
+p <- 2
+q <- 4
+
+# Vòng lặp qua các ngành
+for (ind in names(industry_return)[names(industry_return) != "Date"]) {
+  
+  ret <- na.omit(as.numeric(industry_return[[ind]]))
+  cat("🔹 Ngành:", ind, "\n")
+  
+  for (dist in dist_list) {
+    spec <- ugarchspec(
+      variance.model = list(model = "gjrGARCH", garchOrder = c(3,2)),
+      mean.model = list(armaOrder = c(p, q), include.mean = FALSE),
+      distribution.model = dist
+    )
+    
+    gjr_fit <- tryCatch({
+      ugarchfit(spec = spec, data = ret, solver = "hybrid", solver.control = list(trace = 0))
+    }, error = function(e) {
+      cat("  ⚠️ Không hội tụ – bỏ mô hình", dist, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(gjr_fit)) {
+      coefs <- coef(gjr_fit)
+      se <- sqrt(diag(gjr_fit@fit$matcoef))
+      
+      shape <- if("shape" %in% names(coefs)) coefs["shape"] else NA
+      shape_sd <- if("shape" %in% names(se)) se["shape"] else NA
+      skew <- if("skew" %in% names(coefs)) coefs["skew"] else NA
+      skew_sd <- if("skew" %in% names(se)) se["skew"] else NA
+      
+      results_gjr <- rbind(results_gjr, data.frame(
+        Industry = ind,
+        Distribution = dist,
+        omega = coefs["omega"], omega_sd = se["omega"],
+        alpha1 = coefs["alpha1"], alpha1_sd = se["alpha1"],
+        alpha2 = coefs["alpha2"], alpha1_sd = se["alpha2"],
+        alpha3 = coefs["alpha3"], alpha1_sd = se["alpha3"],
+        gamma1 = coefs["gamma1"], gamma1_sd = se["gamma1"],
+        gamma2 = coefs["gamma2"], gamma1_sd = se["gamma2"],
+        gamma3 = coefs["gamma3"], gamma1_sd = se["gamma3"],
+        beta1 = coefs["beta1"], beta1_sd = se["beta1"],
+        beta2 = coefs["beta2"], beta1_sd = se["beta2"],
+        shape = shape, shape_sd = shape_sd,
+        skew = skew, skew_sd = skew_sd,
+        LLF = likelihood(gjr_fit),
+        AIC = infocriteria(gjr_fit)[1],
+        BIC = infocriteria(gjr_fit)[2]
+      ))
+      
+      cat("  ✅ Fit thành công cho", dist, "\n")
+      
+      # Kiểm định Ljung-Box trên phần dư chuẩn hóa
+      resid_std <- residuals(gjr_fit, standardize = TRUE)
+      for (lag in c(1,5,10)) {
+        lb <- Box.test(resid_std, lag = lag, type = "Ljung-Box")
+        cat("    Ljung-Box lag(", lag, "): p-value =", round(lb$p.value,4), "\n")
+      }
+      
+      # Kiểm định Engle ARCH
+      for (lag in c(1,5,10)) {
+        arch <- ArchTest(resid_std, lags = lag)
+        cat("    Engle ARCH lag(", lag, "): p-value =", round(arch$p.value,4), "\n")
+      }
+      
+      cat("------------------------------------------------------------\n")
+    }
+  }
+}
+
+# Xem kết quả
+print(results_gjr)
+```
+
+
+### 3.4. Chọn mô hình tối ưu
+```{r}
+#Chọn được mô hình GJR GARCH sged (3,2) 
+#RealEstate
+spec_realestate <- ugarchspec(
+      variance.model = list(model = "gjrGARCH", garchOrder = c(3,2)),
+      mean.model = list(armaOrder = c(2, 4), include.mean = FALSE),
+      distribution.model = "sged")
+fit_realestate <-  ugarchfit(spec = spec_realestate, data = na.omit(industry_return$RealEstate))
+resid_realestate <- as.numeric(residuals(fit_realestate,standardize = TRUE))
+
+#Banks
+spec_banks <- ugarchspec(
+      variance.model = list(model = "gjrGARCH", garchOrder = c(3,2)),
+      mean.model = list(armaOrder = c(2, 4), include.mean = FALSE),
+      distribution.model = "sged")
+fit_banks <-  ugarchfit(spec = spec_banks, data = na.omit(industry_return$Banks))
+resid_banks <- as.numeric(residuals(fit_banks,standardize = TRUE))
+
+#FinancialServices
+spec_financialservices <- ugarchspec(
+      variance.model = list(model = "gjrGARCH", garchOrder = c(3,2)),
+      mean.model = list(armaOrder = c(2, 4), include.mean = FALSE),
+      distribution.model = "sged")
+fit_financialservices <-  ugarchfit(spec = spec_financialservices, data = na.omit(industry_return$FinancialServices))
+resid_financialservices <- as.numeric(residuals(fit_financialservices,standardize = TRUE))
+
+#Insurance
+spec_insurance <- ugarchspec(
+      variance.model = list(model = "gjrGARCH", garchOrder = c(3,2)),
+      mean.model = list(armaOrder = c(2, 4), include.mean = FALSE),
+      distribution.model = "sged")
+fit_insurance <-  ugarchfit(spec = spec_insurance, data = na.omit(industry_return$Insurance))
+resid_insurance <- as.numeric(residuals(fit_insurance,standardize = TRUE))
+
+#Finance
+spec_finance <- ugarchspec(
+      variance.model = list(model = "gjrGARCH", garchOrder = c(3,2)),
+      mean.model = list(armaOrder = c(2, 4), include.mean = FALSE),
+      distribution.model = "sged")
+fit_finance <-  ugarchfit(spec = spec_finance, data = na.omit(industry_return$Finance))
+resid_finance <- as.numeric(residuals(fit_finance,standardize = TRUE))
+```
+
+## 4. Copula
+```{r}
+# =============================================================
+#  Chuyển phần dư chuẩn hoá sang U(0,1)
+# =============================================================
+
+# RealEstate
+u_realestate <- psged(resid_realestate,
+                      mean = 0,
+                      sd   = 1,
+                      nu   = coef(fit_realestate)["shape"],
+                      xi   = coef(fit_realestate)["skew"])
+ks_realestate <- ks.test(u_realestate, "punif", 0, 1)
+cat("Kolmogorov–Smirnov p-value (RealEstate):", round(ks_realestate$p.value, 4), "\n")
+
+# Banks
+u_banks <- psged(resid_banks,
+                 mean = 0,
+                 sd   = 1,
+                 nu   = coef(fit_banks)["shape"],
+                 xi   = coef(fit_banks)["skew"])
+ks_banks <- ks.test(u_banks, "punif", 0, 1)
+cat("Kolmogorov–Smirnov p-value (Banks):", round(ks_banks$p.value, 4), "\n")
+
+# FinancialServices
+u_financialservices <- psged(resid_financialservices,
+                 mean = 0,
+                 sd   = 1,
+                 nu   = coef(fit_financialservices)["shape"],
+                 xi   = coef(fit_financialservices)["skew"])
+ks_financialservices <- ks.test(u_financialservices, "punif", 0, 1)
+cat("Kolmogorov–Smirnov p-value (FinancialServices):", round(ks_financialservices$p.value, 4), "\n")
+
+# Insurance
+u_insurance <- psged(resid_insurance,
+                 mean = 0,
+                 sd   = 1,
+                 nu   = coef(fit_insurance)["shape"],
+                 xi   = coef(fit_insurance)["skew"])
+ks_insurance <- ks.test(u_insurance, "punif", 0, 1)
+cat("Kolmogorov–Smirnov p-value (Insurance):", round(ks_insurance$p.value, 4), "\n")
+
+# Finance
+u_finance <- psged(resid_finance,
+                 mean = 0,
+                 sd   = 1,
+                 nu   = coef(fit_finance)["shape"],
+                 xi   = coef(fit_finance)["skew"])
+ks_finance <- ks.test(u_finance, "punif", 0, 1)
+cat("Kolmogorov–Smirnov p-value (Finance):", round(ks_finance$p.value, 4), "\n")
+
+# =============================================================
+#  Kiểm tra trực quan (không bắt buộc)
+# =============================================================
+par(mfrow = c(1,3))
+hist(u_realestate, main = "U(0,1) RealEstate", breaks = 20)
+hist(u_banks, main = "U(0,1) Banks", breaks = 20)
+hist(u_financialservices, main = "U(0,1) FinancialServices", breaks = 20)
+hist(u_insurance, main = "U(0,1) Insurance", breaks = 20)
+hist(u_finance, main = "U(0,1) Finance", breaks = 20)
+
+# =============================================================
+#  Gộp lại thành ma trận U để dùng cho Copula
+# =============================================================
+U_matrix <- cbind(u_realestate, u_banks, u_financialservices, u_insurance, u_finance)
+colnames(U_matrix) <- c("RealEstate", "Banks", "FinancialServices","Insurance","Finance")
+
+head(U_matrix)
+```
+```{r}
+# Danh sách copula thử
+copula_list <- c("normal", "t", "clayton", "gumbel", "frank")
+
+# Danh sách cặp ngành muốn chạy copula
+pairs_list <- list(
+  c("RealEstate", "Banks"),
+  c("RealEstate", "FinancialServices"),
+  c("RealEstate","Insurance"),
+  c("RealEstate","Finance")
+)
+
+# Data U đã chuẩn hóa
+U_matrix <- cbind(u_realestate, u_banks, u_financialservices,u_insurance,u_finance)
+colnames(U_matrix) <- c("RealEstate", "Banks", "FinancialServices","Insurance","Finance")
+
+# Lưu kết quả
+results_copula <- list()
+
+# Vòng lặp qua các cặp
+for(pair in pairs_list){
+  
+  cat("===== Pair:", pair[1], "-", pair[2], "=====\n")
+  U_pair <- U_matrix[, pair]
+  
+  results_pair <- data.frame(
+    Copula = character(),
+    Param1 = numeric(),
+    Param2 = numeric(),
+    DF = numeric(),
+    LogLik = numeric(),
+    AIC = numeric(),
+    BIC = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for(cop_name in copula_list){
+    # Khởi tạo copula
+    cop <- switch(cop_name,
+                  normal = normalCopula(dim = 2, dispstr = "un"),
+                  t = tCopula(dim = 2, dispstr = "un", df = 4, df.fixed = FALSE),
+                  clayton = claytonCopula(dim = 2),
+                  gumbel = gumbelCopula(dim = 2),
+                  frank = frankCopula(dim = 2))
+    
+    # Fit copula
+    fit <- tryCatch({
+      fitCopula(cop, data = U_pair, method = "ml")
+    }, error = function(e){
+      cat(" ⚠️ Lỗi fit copula", cop_name, "\n")
+      return(NULL)
+    })
+    
+    if(!is.null(fit)){
+      params <- coef(fit)
+      param1 <- params[1]
+      param2 <- ifelse(length(params) > 1, params[2], NA)
+      df_val <- if(cop_name == "t") tail(params, 1) else NA
+      ll <- logLik(fit)
+      aic_val <- AIC(fit)
+      bic_val <- BIC(fit)
+      
+      results_pair <- rbind(results_pair, data.frame(
+        Copula = cop_name,
+        Param1 = param1,
+        Param2 = param2,
+        DF = df_val,
+        LogLik = ll,
+        AIC = aic_val,
+        BIC = bic_val
+      ))
+      
+      cat("Copula:", cop_name, "| Param1:", round(param1,4),
+          "| Param2:", ifelse(is.na(param2), "-", round(param2,4)),
+          "| DF:", ifelse(is.na(df_val), "-", round(df_val,4)),
+          "| LogLik:", round(ll,4),
+          "| AIC:", round(aic_val,4),
+          "| BIC:", round(bic_val,4), "\n")
+    }
+  }
+  
+  results_copula[[paste(pair, collapse = "-")]] <- results_pair
+  cat("------------------------------------------------------------\n")
+}
+
+# Xem kết quả tóm tắt
+results_copula
+
+```
+
+## 5. DCC-GARCH
+```{r}
+
+# ==============================
+# Bước 1. Xây mô hình DCC–T cho từng cặp
+# ==============================
+
+# Định nghĩa mô hình DCC-T (Student-t Copula)
+uspec <- ugarchspec(mean.model = list(armaOrder = c(2,4),include.mean = FALSE), 
+                    variance.model = list(garchOrder = c(3,2)), 
+                    distribution.model = "sged")
+
+# Hàm phụ: fit DCC cho 2 ngành và trích kết quả
+fit_dcc_pair <- function(series1, series2, name1, name2) {
+  # Gom dữ liệu 2 ngành, bỏ NA
+  data_pair <- na.omit(cbind(series1, series2))
+  colnames(data_pair) <- c(name1, name2)
+  
+  # Định nghĩa DCC–T Copula
+  dcc_spec <- dccspec(
+    uspec = multispec(replicate(2, uspec)),
+    dccOrder = c(1,1),
+    distribution = "mvt"   # multivariate Student-t
+  )
+  
+  # Fit mô hình DCC
+  dcc_fit <- dccfit(dcc_spec, data = data_pair, fit.control = list(eval.se = TRUE))
+  
+  # Lấy tham số ước lượng
+  params <- as.data.frame(dcc_fit@mfit$matcoef)
+  colnames(params) <- c("Estimate", "t_value")
+  
+  # Tìm giá trị alpha, beta, nu (dof)
+  alpha <- params["[Joint]dcca1", ]
+  beta  <- params["[Joint]dccb1", ]
+  nu    <- params["[Joint]mshape", ]
+  
+  # AIC, BIC, Log Likelihood
+  AIC_value <- infocriteria(dcc_fit)[1]
+  BIC_value <- infocriteria(dcc_fit)[2]
+  LL_value  <- likelihood(dcc_fit)
+  
+  # Gom thành bảng kết quả
+  result <- data.frame(
+    Pair = paste(name1, "-", name2),
+    nu = round(nu$Estimate, 4),
+    nu_t = round(nu$t_value, 4),
+    alpha = round(alpha$Estimate, 4),
+    alpha_t = round(alpha$t_value, 4),
+    beta = round(beta$Estimate, 4),
+    beta_t = round(beta$t_value, 4),
+    AIC = round(AIC_value, 4),
+    BIC = round(BIC_value, 4),
+    LogLik = round(LL_value, 4)
+  )
+  
+  # Trả kết quả + mô hình để vẽ tương quan động
+  return(list(result = result, model = dcc_fit))
+}
+
+# ==============================
+# Bước 2. Chạy từng cặp
+# ==============================
+result_RE_Banks <- fit_dcc_pair(industry_return$RealEstate, industry_return$Banks, "RealEstate", "Banks")
+result_RE_Financial <- fit_dcc_pair(industry_return$RealEstate, industry_return$FinancialServices, "RealEstate", "FinancialServices")
+result_RE_Insurance <- fit_dcc_pair(industry_return$RealEstate, industry_return$Insurance, "RealEstate", "Insurance")
+result_RE_Finance <- fit_dcc_pair(industry_return$RealEstate, industry_return$Finance, "RealEstate", "Finance")
+
+# ==============================
+# Bước 3. Gộp kết quả thành bảng
+# ==============================
+final_results <- rbind(result_RE_Banks$result,
+                       result_RE_Financial$result,
+                       result_RE_Insurance$result,
+                       result_RE_Finance$result)
+
+print(final_results)
+
+# ==============================
+# Bước 4. Vẽ tương quan động
+# ==============================
+R_t_RE_Banks <- rcor(result_RE_Banks$model)   # ma trận tương quan động
+corr_RE_Banks <- R_t_RE_Banks[1,2,]           # hệ số tương quan giữa 2 ngành
+plot(corr_RE_Banks, type = "l", col = "blue",
+     main = "Dynamic Correlation: RealEstate - Banks",
+     ylab = "Correlation", xlab = "Time")
+
+R_t_RE_FinancialServices <- rcor(result_RE_Financial$model)   # ma trận tương quan động
+corr_RE_FinancialServices <- R_t_RE_FinancialServices[1,2,]           # hệ số tương quan giữa 2 ngành
+plot(corr_RE_FinancialServices, type = "l", col = "blue",
+     main = "Dynamic Correlation: RealEstate - FinancialServices",
+     ylab = "Correlation", xlab = "Time")
+
+R_t_RE_Insurance <- rcor(result_RE_Insurance$model)   # ma trận tương quan động
+corr_RE_Insurance <- R_t_RE_Insurance[1,2,]           # hệ số tương quan giữa 2 ngành
+plot(corr_RE_Insurance, type = "l", col = "blue",
+     main = "Dynamic Correlation: RealEstate - Insurance",
+     ylab = "Correlation", xlab = "Time")
+
+R_t_RE_Finance <- rcor(result_RE_Finance$model)   # ma trận tương quan động
+corr_RE_Finance <- R_t_RE_Finance[1,2,]           # hệ số tương quan giữa 2 ngành
+plot(corr_RE_Finance, type = "l", col = "blue",
+     main = "Dynamic Correlation: RealEstate - Finance",
+     ylab = "Correlation", xlab = "Time")
+```
+```{r}
+acf(corr_RE_Banks, main="ACF of dynamic correlation between Real Estate and Banks")
+acf(corr_RE_FinancialServices, main="ACF of dynamic correlation between Real Estate and Financial Services")
+acf(corr_RE_Insurance, main="ACF of dynamic correlation between Real Estate and Insurance")
+acf(corr_RE_Finance, main="ACF of dynamic correlation between Real Estate and Finance")
+```
+
+## 6. Tính CoVaR các ngành tài chính
+### 6.1. Tính CoVaR khi Real Estate ở trạng thái VaR
+```{r}
+alpha_level <- 0.05  # mức tin cậy 95%
+
+# Hàm tính VaR theo ngành
+compute_VaR_sged <- function(fit, alpha_level) {
+  mu_i <- 0  # do mô hình trước dùng include.mean = FALSE
+  sigma_t <- sigma(fit)    # volatility động theo thời điểm
+  skew_i <- coef(fit)["skew"]
+  shape_i <- coef(fit)["shape"]
+  
+  VaR <- mu_i + sigma_t * qdist("sged", 
+                                p = alpha_level, 
+                                mu = 0, sigma = 1, 
+                                skew = skew_i, 
+                                shape = shape_i)
+  return(VaR)
+}
+
+# Tính VaR cho từng ngành
+VaR_realestate       <- compute_VaR_sged(fit_realestate, alpha_level)
+VaR_banks            <- compute_VaR_sged(fit_banks, alpha_level)
+VaR_financialservices <- compute_VaR_sged(fit_financialservices, alpha_level)
+VaR_insurance        <- compute_VaR_sged(fit_insurance, alpha_level)
+VaR_finance          <- compute_VaR_sged(fit_finance, alpha_level)
+
+# Tạo dataframe
+VaR_df <- data.frame(
+  Date = industry_return$Date[-1],  # bỏ NA đầu nếu cần
+  RealEstate = VaR_realestate,
+  Banks = VaR_banks,
+  FinancialServices = VaR_financialservices,
+  Insurance = VaR_insurance,
+  Finance = VaR_finance
+)
+
+head(VaR_df)
+```
+
+
+```{r}
+#Hàm tính CoVaR
+compute_CoVaR_TDCC_full <- function(u_i,         # uniform của sector i (conditioning) (0-1)
+                                   u_j,         # uniform của sector j (target) (0-1)
+                                   dcc_model,   # fitted DCC model object
+                                   mu_j,        # conditional mean từ GARCH fit của j
+                                   sigma_j,     # conditional sigma từ GARCH fit của j
+                                   alpha_VaR,  # mức rủi ro
+                                   alpha_CoVaR
+                                   ) {
+  
+  n <- length(u_i)
+  if(length(u_j)!=n || length(mu_j)!=n || length(sigma_j)!=n) stop("Các vector phải cùng chiều.")
+  
+  # ----- lấy rho_t từ DCC -----
+  rho_arr <- rcor(dcc_model)   # dim (nAssets, nAssets, n)
+  rho_t <- rho_arr[1,2,]
+  n <- min(n, length(rho_t))
+  u_i <- u_i[1:n]; u_j <- u_j[1:n]; mu_j <- mu_j[1:n]; sigma_j <- sigma_j[1:n]; rho_t <- rho_t[1:n]
+  
+  # ----- lấy degree of freedom (nu) từ DCC -----
+  nu <- NA
+  mat <- dcc_model@mfit$matcoef
+  possible_names <- c("nu","[Joint]mshape","mshape","shape","dof","dof1")
+  for(nm in possible_names){
+    if(nm %in% rownames(mat)) {nu <- as.numeric(mat[nm," Estimate"]); break}
+  }
+  if(is.na(nu)) stop("Không tìm được nu trong dcc_model")
+  
+  # ----- chuẩn bị output -----
+  CoVaR_u    <- numeric(n)
+  CoVaR_qt   <- numeric(n)
+  
+  eps <- 1e-8
+  u_i <- pmin(pmax(u_i, eps), 1-eps)
+  u_j <- pmin(pmax(u_j, eps), 1-eps)
+  
+  # ----- vòng tính CoVaR -----
+  for(t in 1:n){
+    rho <- pmin(pmax(rho_t[t], -0.9999), 0.9999)
+    x_t <- qt(alpha_VaR, df=nu)  # VaR_i t-scale
+    mean_c <- rho * x_t
+    sd_c   <- sqrt((nu + x_t^2)/(nu+1) * (1 - rho^2))
+    q_cond_t <- mean_c + sd_c * qt(alpha_CoVaR, df=nu+1)
+    
+    # map về uniform
+    CoVaR_u[t] <- pt(q_cond_t, df=nu)
+    CoVaR_qt[t] <- q_cond_t
+  }
+  
+  return(list(
+    CoVaR_u = CoVaR_u,   # uniform
+    CoVaR_qt = CoVaR_qt, # t-scale
+    nu = nu,
+    rho_t = rho_t
+  ))
+}
+```
+```{r}
+#CoVaR Real Estate - Banks
+mu_banks    <- rep(0, length(u_realestate))
+sigma_t_banks <- sigma(fit_banks)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_banks,          # target sector = Banks
+  dcc_model = result_RE_Banks$model,
+  mu_j = mu_banks,
+  sigma_j = sigma_t_banks,
+  alpha_VaR = 0.05,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_banks <- fit_banks@fit$matcoef["shape"," Estimate"]
+skew_banks  <- fit_banks@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_banks <- qsged(CoVaR_out$CoVaR_u, nu = shape_banks, xi=skew_banks)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_Banks_given_RE <- 0 + sigma_t_banks * q_sged_RE_banks
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_Banks_given_RE)
+summary(CoVaR_Banks_given_RE)
+plot(industry_return$Date[-1],CoVaR_Banks_given_RE, type="l", main="CoVaR Banks | RealEstate (alpha=0.05)")
+```
+
+
+```{r}
+#CoVaR Real Estate - Financial Services
+mu_financialservices <- rep(0, length(u_realestate))
+sigma_t_financialservices <- sigma(fit_financialservices)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_financialservices,          # target sector = FinancialServices
+  dcc_model = result_RE_Financial$model,
+  mu_j = mu_financialservices,
+  sigma_j = sigma_t_financialservices,
+  alpha_VaR = 0.05,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_financialservices <- fit_financialservices@fit$matcoef["shape"," Estimate"]
+skew_financialservices  <- fit_financialservices@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_financialservices <- qsged(CoVaR_out$CoVaR_u, nu = shape_financialservices, xi=skew_financialservices)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_financial_given_RE <- 0 + sigma_t_financialservices * q_sged_RE_financialservices
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_financial_given_RE)
+summary(CoVaR_financial_given_RE)
+plot(industry_return$Date[-1],CoVaR_financial_given_RE, type="l", main="CoVaR FinancialServices | RealEstate (alpha=0.05)")
+```
+
+```{r}
+#CoVaR Real Estate - Insurance
+mu_insurance <- rep(0, length(u_realestate))
+sigma_t_insurance <- sigma(fit_insurance)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_insurance,          # target sector = Insurance
+  dcc_model = result_RE_Insurance$model,
+  mu_j = mu_insurance,
+  sigma_j = sigma_t_insurance,
+  alpha_VaR = 0.05,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_insurance <- fit_insurance@fit$matcoef["shape"," Estimate"]
+skew_insurance  <- fit_insurance@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_insurance <- qsged(CoVaR_out$CoVaR_u, nu = shape_insurance, xi=skew_insurance)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_insurance_given_RE <- 0 + sigma_t_insurance * q_sged_RE_insurance
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_insurance_given_RE)
+summary(CoVaR_insurance_given_RE)
+plot(industry_return$Date[-1],CoVaR_insurance_given_RE, type="l", main="CoVaR Insurance | RealEstate (alpha=0.05)")
+```
+```{r}
+#CoVaR Real Estate - Finance
+mu_finance <- rep(0, length(u_realestate))
+sigma_t_finance <- sigma(fit_finance)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_finance,          # target sector = Finance
+  dcc_model = result_RE_Finance$model,
+  mu_j = mu_finance,
+  sigma_j = sigma_t_finance,
+  alpha_VaR = 0.05,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_finance <- fit_finance@fit$matcoef["shape"," Estimate"]
+skew_finance  <- fit_finance@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_finance <- qsged(CoVaR_out$CoVaR_u, nu = shape_finance, xi=skew_finance)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_finance_given_RE <- 0 + sigma_t_finance * q_sged_RE_finance
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_finance_given_RE)
+summary(CoVaR_finance_given_RE)
+plot(industry_return$Date[-1],CoVaR_finance_given_RE, type="l", main="CoVaR Finance | RealEstate (alpha=0.05)")
+```
+
+```{r}
+library(dplyr)
+library(lubridate)
+
+# Lập bảng daily CoVaR
+CoVaR_data <- data.frame(
+  Date = industry_return$Date[-1],
+  Banks = CoVaR_Banks_given_RE,
+  FinancialServices = CoVaR_financial_given_RE,
+  Insurance = CoVaR_insurance_given_RE,
+  Finance = CoVaR_finance_given_RE
+)
+
+# Thêm cột Year
+CoVaR_data <- CoVaR_data %>%
+  mutate(Year = year(Date))
+
+# Tính average annual CoVaR
+CoVaR_annual <- CoVaR_data %>%
+  group_by(Year) %>%
+  summarise(
+    Banks = mean(Banks, na.rm = TRUE),
+    FinancialServices = mean(FinancialServices, na.rm = TRUE),
+    Insurance = mean(Insurance, na.rm = TRUE),
+    Finance = mean(Finance, na.rm = TRUE)
+  )
+
+# Hiển thị bảng
+print(CoVaR_annual, digits = 4)
+```
+
+### 6.2. Tính CoVaR khi Real Estate ở trạng thái Median
+```{r}
+#Tính median cho từng ngành
+alpha_level <- 0.5  # mức tin cậy 50%
+
+# Hàm tính median theo ngành
+compute_VaR_sged_1 <- function(fit, alpha_level) {
+  mu_i <- 0  # do mô hình trước dùng include.mean = FALSE
+  sigma_t <- sigma(fit)    # volatility động theo thời điểm
+  skew_i <- coef(fit)["skew"]
+  shape_i <- coef(fit)["shape"]
+  
+  VaR <- mu_i + sigma_t * qdist("sged", 
+                                p = alpha_level, 
+                                mu = 0, sigma = 1, 
+                                skew = skew_i, 
+                                shape = shape_i)
+  return(VaR)
+}
+
+# Tính median cho từng ngành
+median_realestate      <- compute_VaR_sged(fit_realestate, alpha_level)
+median_banks            <- compute_VaR_sged(fit_banks, alpha_level)
+median_financialservices <- compute_VaR_sged(fit_financialservices, alpha_level)
+median_insurance        <- compute_VaR_sged(fit_insurance, alpha_level)
+median_finance          <- compute_VaR_sged(fit_finance, alpha_level)
+
+# Tạo dataframe
+median_df <- data.frame(
+  Date = industry_return$Date[-1],  # bỏ NA đầu nếu cần
+  RealEstate = median_realestate,
+  Banks = median_banks,
+  FinancialServices = median_financialservices,
+  Insurance = median_insurance,
+  Finance = median_finance
+)
+
+head(median_df)
+```
+
+```{r}
+#Tính CoVaR tại khi Real Estate bình thường (median)
+
+#CoVaR Real Estate - Banks 
+mu_banks    <- rep(0, length(u_realestate))
+sigma_t_banks <- sigma(fit_banks)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_banks,          # target sector = Banks
+  dcc_model = result_RE_Banks$model,
+  mu_j = mu_banks,
+  sigma_j = sigma_t_banks,
+  alpha_VaR = 0.5,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_banks <- fit_banks@fit$matcoef["shape"," Estimate"]
+skew_banks  <- fit_banks@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_banks <- qsged(CoVaR_out$CoVaR_u, nu = shape_banks, xi=skew_banks)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_Banks_given_median_RE <- 0 + sigma_t_banks * q_sged_RE_banks
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_Banks_given_median_RE)
+summary(CoVaR_Banks_given_median_RE)
+plot(industry_return$Date[-1],CoVaR_Banks_given_median_RE, type="l", main="CoVaR Banks | RealEstate (alpha=0.5)")
+```
+```{r}
+#CoVaR Real Estate - Financial Services
+mu_financialservices <- rep(0, length(u_realestate))
+sigma_t_financialservices <- sigma(fit_financialservices)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_financialservices,          # target sector = FinancialServices
+  dcc_model = result_RE_Financial$model,
+  mu_j = mu_financialservices,
+  sigma_j = sigma_t_financialservices,
+  alpha_VaR = 0.5,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_financialservices <- fit_financialservices@fit$matcoef["shape"," Estimate"]
+skew_financialservices  <- fit_financialservices@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_financialservices <- qsged(CoVaR_out$CoVaR_u, nu = shape_financialservices, xi=skew_financialservices)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_financial_given_median_RE <- 0 + sigma_t_financialservices * q_sged_RE_financialservices
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_financial_given_median_RE)
+summary(CoVaR_financial_given_median_RE)
+plot(industry_return$Date[-1],CoVaR_financial_given_median_RE, type="l", main="CoVaR FinancialServices | RealEstate (alpha=0.5)")
+```
+```{r}
+#CoVaR Real Estate - Insurance
+mu_insurance <- rep(0, length(u_realestate))
+sigma_t_insurance <- sigma(fit_insurance)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_insurance,          # target sector = Insurance
+  dcc_model = result_RE_Insurance$model,
+  mu_j = mu_insurance,
+  sigma_j = sigma_t_insurance,
+  alpha_VaR = 0.5,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_insurance <- fit_insurance@fit$matcoef["shape"," Estimate"]
+skew_insurance  <- fit_insurance@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_insurance <- qsged(CoVaR_out$CoVaR_u, nu = shape_insurance, xi=skew_insurance)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_insurance_given_median_RE <- 0 + sigma_t_insurance * q_sged_RE_insurance
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_insurance_given_median_RE)
+summary(CoVaR_insurance_given_median_RE)
+plot(industry_return$Date[-1],CoVaR_insurance_given_median_RE, type="l", main="CoVaR Insurance | RealEstate (alpha=0.5)")
+```
+
+
+```{r}
+#CoVaR Real Estate - Finance
+mu_finance <- rep(0, length(u_realestate))
+sigma_t_finance <- sigma(fit_finance)
+
+# ----- Step 3: gọi hàm CoVaR -----
+CoVaR_out <- compute_CoVaR_TDCC_full(
+  u_i = u_realestate,     # conditioning sector = RealEstate
+  u_j = u_finance,          # target sector = Finance
+  dcc_model = result_RE_Finance$model,
+  mu_j = mu_finance,
+  sigma_j = sigma_t_finance,
+  alpha_VaR = 0.5,
+  alpha_CoVaR = 0.05
+)
+
+# ----- Step 4: map từ uniform -> quantile SGED -----
+shape_finance <- fit_finance@fit$matcoef["shape"," Estimate"]
+skew_finance  <- fit_finance@fit$matcoef["skew"," Estimate"]
+
+q_sged_RE_finance <- qsged(CoVaR_out$CoVaR_u, nu = shape_finance, xi=skew_finance)  # quantile SGED
+
+# ----- Step 5: scale về return gốc -----
+CoVaR_finance_given_median_RE <- 0 + sigma_t_finance * q_sged_RE_finance
+
+# ----- Step 6: xem kết quả -----
+head(CoVaR_finance_given_median_RE)
+summary(CoVaR_finance_given_median_RE)
+plot(industry_return$Date[-1],CoVaR_finance_given_median_RE, type="l", main="CoVaR Finance | RealEstate (alpha=0.5)")
+```
+
+## 7. Tính deltaCoVaR
+```{r}
+#Tính deltaCoVaR
+
+# ====================================
+# Bước 1: Tính deltaCoVaR theo ngày
+# ====================================
+percent_CoVaR <- data.frame(
+  Date = industry_return$Date[-1],
+  Banks = (CoVaR_Banks_given_RE - CoVaR_Banks_given_median_RE) ,
+  FinancialServices = (CoVaR_financial_given_RE - CoVaR_financial_given_median_RE) ,
+  Insurance = (CoVaR_insurance_given_RE - CoVaR_insurance_given_median_RE),
+  Finance = (CoVaR_finance_given_RE- CoVaR_finance_given_median_RE))
+# Vẽ
+plot(percent_CoVaR$Banks, type = "l", col = "red",
+     main = "deltaCoVaR (Banks | Real Estate)", ylab = "deltaCoVaR", xlab = "Time")
+
+plot(percent_CoVaR$FinancialServices, type = "l", col = "red",
+     main = "deltaCoVaR (Financial Services | Real Estate)", ylab = "deltaCoVaR", xlab = "Time")
+
+plot(percent_CoVaR$Insurance, type = "l", col = "red",
+     main = "deltaCoVaR (Insurance | Real Estate)", ylab = "deltaCoVaR", xlab = "Time")
+
+plot(percent_CoVaR$Finance, type = "l", col = "red",
+     main = "deltaCoVaR (Finance | Real Estate)", ylab = "deltaCoVaR", xlab = "Time")
+```
+
+```{r}
+# Thêm cột Year
+percent_CoVaR <- percent_CoVaR %>%
+  mutate(Year = year(Date))
+
+# Tính average annual deltaCoVaR 
+percent_CoVaR_annual <- percent_CoVaR %>%
+  group_by(Year) %>%
+  summarise(
+    Banks = mean(Banks, na.rm = TRUE),
+    FinancialServices = mean(FinancialServices, na.rm = TRUE),
+    Insurance = mean(Insurance, na.rm = TRUE),
+    Finance = mean(Finance, na.rm = TRUE)
+  )
+
+# Hiển thị bảng
+print(percent_CoVaR_annual, digits = 4)
+```
+
